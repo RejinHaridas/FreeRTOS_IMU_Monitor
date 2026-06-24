@@ -1,0 +1,24 @@
+# Build output
+Debug/
+Release/
+build/
+
+# IDE files
+.settings/
+.cproject
+.mxproject
+*.launch
+
+# Binaries
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+
+# Object files
+*.o
+*.d
+
+# STM32CubeMX backup
+*.bak
