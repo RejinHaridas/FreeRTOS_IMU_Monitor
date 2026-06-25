@@ -49,6 +49,8 @@
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 
+IWDG_HandleTypeDef hiwdg;
+
 UART_HandleTypeDef huart2;
 
 /* Definitions for defaultTask */
@@ -71,6 +73,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_IWDG_Init(void);
 void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
@@ -79,10 +82,12 @@ void printTask(void *pvParameters);
 void mpuRead(void *pvParameters);
 void uart_print(const char*);
 void alertTask(void *pvParameters);
+void watchdogTask(void *pvParameters);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
 
 /* USER CODE END 0 */
 
@@ -117,8 +122,10 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_I2C1_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
 
+  HAL_UART_Transmit(&huart2, (uint8_t*)"Starting...\r\n", 13, HAL_MAX_DELAY);
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -182,6 +189,7 @@ int main(void)
 //  /* Create Task for reading the MPU Data*/
   xTaskCreate(mpuRead,"MPU",512,NULL,3, NULL);
   xTaskCreate(alertTask,"Alert",256,NULL,1, NULL);
+  xTaskCreate(watchdogTask, "WDG", 256, NULL, 1, NULL);
 
   vTaskStartScheduler();
   /* add events, ... */
@@ -221,9 +229,10 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = 16;
@@ -281,6 +290,34 @@ static void MX_I2C1_Init(void)
   /* USER CODE BEGIN I2C1_Init 2 */
 
   /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief IWDG Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_IWDG_Init(void)
+{
+
+  /* USER CODE BEGIN IWDG_Init 0 */
+
+  /* USER CODE END IWDG_Init 0 */
+
+  /* USER CODE BEGIN IWDG_Init 1 */
+
+  /* USER CODE END IWDG_Init 1 */
+  hiwdg.Instance = IWDG;
+  hiwdg.Init.Prescaler = IWDG_PRESCALER_32;
+  hiwdg.Init.Reload = 3999;
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN IWDG_Init 2 */
+
+  /* USER CODE END IWDG_Init 2 */
 
 }
 
@@ -428,6 +465,27 @@ void uart_print(const char *msg) {
      * In real firmware: log this as an error
 */
 
+}
+
+void watchdogTask(void *pvParameters) {
+    char msg[50];
+    uint32_t kick_count = 0;
+
+    /* Small startup delay — let other tasks initialize first */
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    while (1) {
+        /* Kick the watchdog — resets 4 second countdown */
+        HAL_IWDG_Refresh(&hiwdg);
+
+        kick_count++;
+        snprintf(msg, sizeof(msg),
+            "[WDG] Kicked #%lu\r\n", kick_count);
+
+        uart_print(msg);
+        /* Sleep 1 second — well within 4 second timeout */
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }
 /* USER CODE END 4 */
 
