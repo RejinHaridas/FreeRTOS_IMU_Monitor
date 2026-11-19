@@ -29,6 +29,8 @@
 #include "string.h"
 #include <stdio.h>
 #include "semphr.h"
+#include "math.h"
+#include <stdint.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -38,7 +40,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define RMS_WINDOW_SIZE       100
+#define WARNING_THRESHOLD     0.20f
+#define CRITICAL_THRESHOLD    0.40f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -66,6 +70,28 @@ QueueHandle_t xSensorQueue;
 QueueHandle_t xAlertQueue;
 SemaphoreHandle_t xUartMutex ;
 
+
+typedef enum
+{
+    HEALTH_NORMAL,
+    HEALTH_WARNING,
+    HEALTH_CRITICAL
+} MachineHealth_t;
+
+float vibration_rms = 0.0f;
+MachineHealth_t machine_health = HEALTH_NORMAL;
+
+float rms_history[5] = {0};
+uint8_t history_index = 0;
+uint8_t history_count = 0;
+
+#define RMS_GROUP_SIZE 5
+
+float previous_rms_average = 0.0f;
+float current_rms_sum = 0.0f;
+
+uint8_t rms_count = 0;
+uint8_t previous_average_available = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -83,7 +109,9 @@ void mpuRead(void *pvParameters);
 void uart_print(const char*);
 void alertTask(void *pvParameters);
 void watchdogTask(void *pvParameters);
-/* USER CODE END PFP */
+float calculateRMS(MPU6050_Data_t *);
+MachineHealth_t classifyMachine(float rms);
+uint8_t checkVibrationTrend(float rms);/* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
@@ -420,53 +448,78 @@ void printTask(void *pvParameters) {
     }
 }
 
-void mpuRead(void *pvParameters) {
-	MPU6050_Data_t Data;
+void mpuRead(void *pvParameters)
+{
+    MPU6050_Data_t Data;
 
-	if (MPU6050_Init(&hi2c1)==MPU6050_ERROR) {
-		char msg[]="Error in MPU Initialisation\r\n";
-		HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg),HAL_MAX_DELAY);
-		vTaskDelete(NULL);
-	}
-
-	while(1) {
-		if(MPU6050_ReadAll(&hi2c1, &Data)==MPU6050_OK) {
-			xQueueSend(xSensorQueue,&Data,pdMS_TO_TICKS(10));
-			xQueueSend(xAlertQueue,&Data,pdMS_TO_TICKS(10));
-		}
-		vTaskDelay(pdMS_TO_TICKS(500));
-	}
-}
-
-void alertTask(void *pvParameters) {
-	MPU6050_Data_t data;
-	char msg[100];
-
-	while(1) {
-		if (xQueueReceive(xAlertQueue, &data,
-		                          portMAX_DELAY) == pdTRUE)  {
-            float mag = data.accel_x ;
-				if (mag > 0.50f){
-				snprintf(msg, sizeof(msg),"[ALERT] Vibration detected! mag=%.2fg\r\n", mag);
-				uart_print(msg);   //mutex-protected
-			}
-		}
-		vTaskDelay(pdMS_TO_TICKS(200));
-	}
-}
-void uart_print(const char *msg) {
-    if (xSemaphoreTake(xUartMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        HAL_UART_Transmit(&huart2, (uint8_t*)msg,
-                          strlen(msg), HAL_MAX_DELAY);
-        xSemaphoreGive(xUartMutex);
+    if (MPU6050_Init(&hi2c1) == MPU6050_ERROR)
+    {
+        char msg[] = "Error in MPU Initialisation\r\n";
+        uart_print(msg);
+        vTaskDelete(NULL);
     }
-/*
-     If Take fails after 100ms — another task holds it too long
-     * In real firmware: log this as an error
-*/
 
+    while (1)
+    {
+        if (MPU6050_ReadAll(&hi2c1, &Data) == MPU6050_OK)
+        {
+            xQueueSend(xSensorQueue, &Data, 0);
+            xQueueSend(xAlertQueue, &Data, 0);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 
+void alertTask(void *pvParameters)
+{
+    MPU6050_Data_t data;
+    char msg[120];
+
+    while (1)
+    {
+        if (xQueueReceive(xAlertQueue, &data,
+                          portMAX_DELAY) == pdTRUE)
+        {
+            float rms = calculateRMS(&data);
+
+            // Process only after collecting 100 samples
+            if (rms >= 0.0f)
+            {
+                machine_health = classifyMachine(rms);
+
+                uint8_t trend = checkVibrationTrend(rms);
+
+                snprintf(msg, sizeof(msg),
+                         "\r\nRMS: %.3f g | ",
+                         rms);
+
+                uart_print(msg);
+
+                if (machine_health == HEALTH_NORMAL)
+                {
+                    uart_print("HEALTH: NORMAL\r\n");
+                }
+                else if (machine_health == HEALTH_WARNING)
+                {
+                    uart_print("HEALTH: WARNING\r\n");
+                }
+                else
+                {
+                    uart_print("HEALTH: CRITICAL\r\n");
+                    uart_print("MAINTENANCE REQUIRED!\r\n");
+                }
+
+                if (trend)
+                {
+                    uart_print(
+                        "[TREND ALERT] Vibration increasing!\r\n"
+                    );
+                }
+            }
+        }
+    }
+}
 void watchdogTask(void *pvParameters) {
     char msg[50];
     uint32_t kick_count = 0;
@@ -487,6 +540,104 @@ void watchdogTask(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
+
+float calculateRMS(MPU6050_Data_t *data)
+{
+    static float sum = 0.0f;
+    static float sum_sq = 0.0f;
+    static uint16_t count = 0;
+
+    float magnitude = sqrtf(
+        data->accel_x * data->accel_x +
+        data->accel_y * data->accel_y +
+        data->accel_z * data->accel_z
+    );
+
+    sum += magnitude;
+    sum_sq += magnitude * magnitude;
+    count++;
+
+    if (count >= RMS_WINDOW_SIZE)
+    {
+        float mean = sum / RMS_WINDOW_SIZE;
+
+        float variance =
+            (sum_sq / RMS_WINDOW_SIZE) - (mean * mean);
+
+        if (variance < 0.0f)
+            variance = 0.0f;
+
+        vibration_rms = sqrtf(variance);
+
+        sum = 0.0f;
+        sum_sq = 0.0f;
+        count = 0;
+
+        return vibration_rms;
+    }
+
+    return -1.0f;
+}
+
+void uart_print(const char *msg)
+{
+    HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+}
+
+MachineHealth_t classifyMachine(float rms)
+{
+    if (rms >= CRITICAL_THRESHOLD)
+    {
+        return HEALTH_CRITICAL;
+    }
+    else if (rms >= WARNING_THRESHOLD)
+    {
+        return HEALTH_WARNING;
+    }
+    else
+    {
+        return HEALTH_NORMAL;
+    }
+}
+
+uint8_t checkVibrationTrend(float rms)
+{
+    current_rms_sum += rms;
+    rms_count++;
+
+    // Wait until 5 RMS readings are collected
+    if (rms_count < RMS_GROUP_SIZE)
+        return 0;
+
+    // Calculate average of the current 5 readings
+    float current_average = current_rms_sum / RMS_GROUP_SIZE;
+
+    // Reset for collecting the next group
+    current_rms_sum = 0.0f;
+    rms_count = 0;
+
+    // First group: store as previous average
+    if (previous_average_available == 0)
+    {
+        previous_rms_average = current_average;
+        previous_average_available = 1;
+        return 0;
+    }
+
+    // Compare current average with previous average
+    uint8_t trend = 0;
+
+    if (current_average > previous_rms_average * 1.10f)
+    {
+        trend = 1;
+    }
+
+    // Update previous average with current average
+    previous_rms_average = current_average;
+
+    return trend;
+}
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
